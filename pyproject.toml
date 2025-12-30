@@ -12,6 +12,7 @@ dependencies = [
     "yt-dlp>=2024.11.4",
     "youtube-transcript-api>=0.6.0",
     "requests>=2.31.0",
+    "openai-whisper>=20250625",
 ]
 
 # Expose the CLI named `transcriptex` -> module:function = main:transcriptex
