@@ -1,0 +1,27 @@
+
+[project]
+name = "transcriptex"
+version = "0.1.0"
+description = "YouTube transcript to TXT/LaTeX with optional local Ollama headings"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "aj" }]
+license = { text = "MIT" }
+dependencies = [
+    "click>=8.1",
+    "yt-dlp>=2024.11.4",
+    "youtube-transcript-api>=0.6.0",
+    "requests>=2.31.0",
+]
+
+# Expose the CLI named `transcriptex` -> module:function = main:transcriptex
+[project.scripts]
+transcriptex = "main:transcriptex"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Package a single module file named `main.py`
+[tool.setuptools]
+py-modules = ["main"]
