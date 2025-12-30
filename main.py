@@ -1,26 +1,38 @@
+
+#!/usr/bin/env python3
 """
-Transcriptex: Download a YouTube transcript (OO interface) via youtube-transcript-api,
-get the video title via yt-dlp, and write both a minimal LaTeX file and a plain-text
-transcript to your home directory.
+Transcriptex (Click-based CLI)
 
-Outputs:
-  ~/transcriptex/transcripts/<title>-<video_id>.txt
-  ~/transcriptex/latex/<title>-<video_id>.tex
+Features:
+- Resolve YouTube video ID & title with yt-dlp
+- Fetch transcript via youtube-transcript-api (OO interface: YouTubeTranscriptApi().fetch)
+- Skip re-download if transcript already exists (use --force to override)
+- Optionally generate headings with a local Ollama model via /api/chat using structured outputs
+  (per-paragraph calls for reliable alignment)
+- Write TXT + LaTeX outputs under ~/transcriptex (configurable with --base-dir)
 
-Usage examples:
-  python transcriptex.py --id https://www.youtube.com/watch?v=dQw4w9WgXcQ
-  python transcriptex.py --id dQw4w9WgXcQ
-  python transcriptex.py --service youtube --id dQw4w9WgXcQ
+Usage:
+  transcriptex [OPTIONS] ID_OR_URL
+
+Examples:
+  transcriptex "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  transcriptex dQw4w9WgXcQ
+  transcriptex dQw4w9WgXcQ --ollama-model llama3.2:3b
+  transcriptex dQw4w9WgXcQ --force --paragraph-chars 600
+
+Dependencies:
+  pip install click yt-dlp youtube-transcript-api requests
 """
 
-import argparse
 import os
 import re
 import sys
-from typing import List, Tuple
+import json
+from typing import List, Tuple, Optional
 
-# External deps:
-#   pip install yt-dlp youtube-transcript-api
+import click
+
+# External deps (install with: pip install yt-dlp youtube-transcript-api)
 try:
     from yt_dlp import YoutubeDL
 except ImportError:
@@ -40,41 +52,23 @@ except ImportError:
     NoTranscriptFound = Exception
     VideoUnavailable = Exception
 
-
-# ------------------------ CLI args ------------------------
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="transcriptex",
-        description="Download a YouTube transcript and output LaTeX + TXT files."
-    )
-    parser.add_argument(
-        "--service",
-        default="youtube",
-        choices=["youtube"],
-        help="Transcript source service (default: youtube)."
-    )
-    parser.add_argument(
-        "--id",
-        required=True,
-        help="Video ID or URL (for YouTube)."
-    )
-    parser.add_argument(
-        "--paragraph-chars",
-        type=int,
-        default=800,
-        help="Approx. characters per paragraph when wrapping transcript text (default: 800)."
-    )
-    return parser.parse_args()
+# requests for Ollama HTTP calls (install with: pip install requests)
+try:
+    import requests
+except ImportError:
+    requests = None
 
 
 # ------------------------ Helpers ------------------------
 
-def ensure_deps():
+def ensure_deps(require_ollama: bool = False):
+    """Ensure mandatory deps are available. If Ollama is requested, ensure requests is present."""
     if YoutubeDL is None:
         raise SystemExit("Missing dependency: yt-dlp. Install with: pip install yt-dlp")
     if YouTubeTranscriptApi is None:
         raise SystemExit("Missing dependency: youtube-transcript-api. Install with: pip install youtube-transcript-api")
+    if require_ollama and requests is None:
+        raise SystemExit("Missing dependency: requests (needed for Ollama). Install with: pip install requests")
 
 
 def expand_home_path(path: str) -> str:
@@ -83,7 +77,7 @@ def expand_home_path(path: str) -> str:
 
 def ensure_dirs(base_dir: str) -> Tuple[str, str]:
     """
-    Ensure ~/transcriptex/transcripts and ~/transcriptex/latex exist.
+    Ensure <base_dir>/transcripts and <base_dir>/latex exist.
     Returns (transcripts_dir, latex_dir).
     """
     transcripts_dir = expand_home_path(os.path.join(base_dir, "transcripts"))
@@ -98,15 +92,11 @@ def slugify_filename(name: str, max_len: int = 120) -> str:
     Make a safe filename from a video title: remove/replace problematic characters,
     collapse whitespace, and limit length.
     """
-    # Replace path separators and reserved characters
-    name = re.sub(r'[\/\\:\*\?"<>\|]', "-", name)
-    # Normalize whitespace
-    name = re.sub(r"\s+", " ", name).strip()
-    # Replace remaining non-ASCII with hyphen (simple guard)
+    name = re.sub(r'[\/\\:\*\?"<>\|]', "-", name)  # reserved/path chars
+    name = re.sub(r"\s+", " ", name).strip()       # normalize whitespace
+    # Keep simple ASCII in filenames to be safe across platforms
     name = "".join(ch if 32 <= ord(ch) < 127 else "-" for ch in name)
-    # Trim and strip trailing dot/space
-    name = name[:max_len].rstrip(" .")
-    # Fallback if empty
+    name = name[:max_len].rstrip(" .")             # strip trailing dot/space
     return name or "untitled"
 
 
@@ -132,7 +122,7 @@ def escape_latex(text: str) -> str:
 def wrap_paragraphs(text_chunks: List[str], approx_chars: int = 800) -> List[str]:
     """
     Combine transcript text chunks into paragraphs of approximately `approx_chars`.
-    Breaks on sentence boundaries when possible.
+    Break on sentence boundaries when possible.
     """
     full = " ".join(t.strip() for t in text_chunks if t and t.strip())
     full = re.sub(r"\s+", " ", full).strip()
@@ -154,13 +144,22 @@ def wrap_paragraphs(text_chunks: List[str], approx_chars: int = 800) -> List[str
     return paragraphs
 
 
-def build_latex_document(title: str, paragraphs: List[str]) -> str:
+def build_latex_document(title: str, paragraphs: List[str], headings: Optional[List[str]] = None) -> str:
     """
-    Create a minimal LaTeX document with a main heading and paragraphs.
-    Use rf-string with doubled braces to avoid f-string/format placeholder collisions.
+    Create a minimal LaTeX document with a main heading and optional subheadings above each paragraph.
+    Uses an rf-string with doubled braces to avoid f-string brace collisions.
     """
     escaped_title = escape_latex(title)
-    body = "\n\n".join(escape_latex(p) for p in paragraphs)
+    blocks = []
+    for i, p in enumerate(paragraphs):
+        heading = None
+        if headings and i < len(headings):
+            heading = headings[i]
+        if heading:
+            blocks.append(rf"\subsection*{{{escape_latex(heading)}}}")
+        blocks.append(escape_latex(p))
+
+    body = "\n\n".join(blocks)
 
     return rf"""\documentclass[12pt]{{article}}
 \usepackage[T1]{{fontenc}}
@@ -198,11 +197,11 @@ def get_youtube_metadata(id_or_url: str) -> Tuple[str, str]:
 
 def get_youtube_transcript(video_id: str) -> List[str]:
     """
-    Fetch the transcript via the OO interface:
+    Fetch transcript via the OO interface:
       ytt_api = YouTubeTranscriptApi()
       transcript = ytt_api.fetch(video_id)
 
-    The returned object is iterable/indexable and each snippet provides:
+    The returned object is iterable/indexable; each snippet typically provides:
       - .text
       - .start
       - .duration
@@ -232,56 +231,231 @@ def get_youtube_transcript(video_id: str) -> List[str]:
         raise RuntimeError(f"Unexpected error fetching transcript: {e}")
 
 
-# ------------------------ Main ------------------------
+# ------------------------ Ollama integration (per-paragraph) ------------------------
 
-def main():
-    args = parse_args()
-    ensure_deps()
+def generate_heading_for_paragraph_ollama(
+    paragraph: str,
+    model: str = "llama3.2:3b",
+    endpoint: str = "http://localhost:11434/api/chat",
+    timeout: int = 30,
+) -> Optional[str]:
+    """
+    Ask Ollama (via /api/chat) for ONE heading for ONE paragraph using structured outputs.
+    Returns the heading string, or None on failure.
+    """
+    if requests is None:
+        return None
 
-    if args.service != "youtube":
-        print("Only 'youtube' is supported at the moment.", file=sys.stderr)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You generate a single heading for the given paragraph. "
+                "Constraints: Do NOT rewrite or paraphrase the paragraph; "
+                "return ONLY a single string (the heading). "
+                "Style: Title Case, 5–9 words, no trailing punctuation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": paragraph,
+        },
+    ]
+
+    # JSON schema for a single string
+    schema = {"type": "string"}
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "format": schema,           # Structured output: a string
+        "options": {
+            "temperature": 0.2,
+            "num_ctx": 4096,
+            "num_predict": 64,
+        },
+    }
+
+    try:
+        resp = requests.post(endpoint, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+
+        content = data.get("message", {}).get("content", "")
+        if not content:
+            return None
+
+        # content should be a JSON string due to 'format': {"type":"string"}
+        try:
+            heading = json.loads(content)
+        except json.JSONDecodeError:
+            # Some models might return plain text. Accept as-is.
+            heading = content.strip()
+
+        # sanitize
+        heading = " ".join(str(heading).split()).rstrip(".!?:;")
+
+        # minimal validity check
+        if len(heading) == 0:
+            return None
+
+        return heading
+
+    except Exception:
+        return None
+
+
+def generate_headings_with_ollama_per_paragraph(
+    paragraphs: List[str],
+    model: str,
+    endpoint: str,
+    timeout: int,
+) -> List[str]:
+    """
+    Generate headings by calling Ollama once per paragraph.
+    Returns a list of headings aligned to 'paragraphs'.
+    """
+    headings: List[str] = []
+    for i, p in enumerate(paragraphs):
+        h = generate_heading_for_paragraph_ollama(
+            paragraph=p, model=model, endpoint=endpoint, timeout=timeout
+        )
+        if h is None:
+            h = f"Section {i+1}"  # fallback only for this paragraph
+        headings.append(h)
+    return headings
+
+
+# ------------------------ Click CLI ------------------------
+
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("id", metavar="ID_OR_URL")
+@click.option(
+    "--service",
+    type=click.Choice(["youtube"], case_sensitive=False),
+    default="youtube",
+    show_default=True,
+    help="Transcript source service.",
+)
+@click.option(
+    "--paragraph-chars",
+    type=int,
+    default=800,
+    show_default=True,
+    help="Approx. characters per paragraph when wrapping transcript text.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Force re-download of transcript even if it already exists.",
+)
+@click.option(
+    "--ollama-model",
+    default=None,
+    help="Use a local Ollama model (e.g., 'llama3.2:3b') to generate headings per paragraph.",
+)
+@click.option(
+    "--ollama-endpoint",
+    default="http://localhost:11434/api/chat",
+    show_default=True,
+    help="Ollama HTTP endpoint (use /api/chat for structured outputs).",
+)
+@click.option(
+    "--ollama-timeout",
+    type=int,
+    default=60,
+    show_default=True,
+    help="Timeout for Ollama requests in seconds.",
+)
+@click.option(
+    "--base-dir",
+    default="~/transcriptex",
+    show_default=True,
+    help="Base directory for outputs (transcripts/ and latex/ will be created).",
+)
+@click.version_option(version="0.1.0", prog_name="transcriptex")
+def transcriptex(id: str, service: str, paragraph_chars: int, force: bool,
+                 ollama_model: Optional[str], ollama_endpoint: str, ollama_timeout: int,
+                 base_dir: str):
+    """
+    Download transcript and produce LaTeX + TXT files under BASE_DIR (default: ~/transcriptex).
+    If --ollama-model is provided, headings are generated via Ollama per paragraph; paragraph text remains unchanged.
+    """
+    require_ollama = bool(ollama_model)
+    ensure_deps(require_ollama=require_ollama)
+
+    if service.lower() != "youtube":
+        click.echo("Only 'youtube' is supported at the moment.", err=True)
         sys.exit(2)
 
     # Resolve metadata (ID + title) using yt-dlp
     try:
-        video_id, title = get_youtube_metadata(args.id)
+        video_id, title = get_youtube_metadata(id)
     except Exception as e:
-        print(f"Error getting video metadata via yt-dlp: {e}", file=sys.stderr)
+        click.echo(f"Error getting video metadata via yt-dlp: {e}", err=True)
         sys.exit(2)
 
-    # Fetch transcript via OO interface
-    try:
-        chunks = get_youtube_transcript(video_id)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(3)
-
-    paragraphs = wrap_paragraphs(chunks, approx_chars=args.paragraph_chars)
-
-    # Build outputs
-    latex_doc = build_latex_document(title, paragraphs)
-    transcript_text = "\n\n".join(paragraphs) if paragraphs else ""
-
-    # Prepare output directories under ~/transcriptex
-    base_dir = expand_home_path("~/transcriptex")
-    transcripts_dir, latex_dir = ensure_dirs(base_dir)
+    # Prepare output directories under base_dir
+    base_dir_expanded = expand_home_path(base_dir)
+    transcripts_dir, latex_dir = ensure_dirs(base_dir_expanded)
 
     # Construct safe filenames: <title>-<video_id>.<ext>
     base_name = f"{slugify_filename(title)}-{video_id}"
     transcript_path = os.path.join(transcripts_dir, f"{base_name}.txt")
     latex_path = os.path.join(latex_dir, f"{base_name}.tex")
 
-    # Write files
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        f.write(transcript_text)
+    # If transcript exists and not forcing re-download, reuse it
+    paragraphs: List[str] = []
+    if os.path.exists(transcript_path) and not force:
+        click.echo(f"🟡 Transcript already exists, skipping download:\n  {transcript_path}")
 
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            transcript_text = f.read().strip()
+
+        if transcript_text:
+            if "\n\n" in transcript_text:
+                paragraphs = [p.strip() for p in transcript_text.split("\n\n") if p.strip()]
+            else:
+                paragraphs = wrap_paragraphs([transcript_text], approx_chars=paragraph_chars)
+        else:
+            paragraphs = []
+    else:
+        # Fresh fetch
+        try:
+            chunks = get_youtube_transcript(video_id)
+        except RuntimeError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(3)
+
+        paragraphs = wrap_paragraphs(chunks, approx_chars=paragraph_chars)
+        transcript_text = "\n\n".join(paragraphs) if paragraphs else ""
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(transcript_text)
+        click.echo(f"📄 Transcript written:\n  {transcript_path}")
+
+    # Optionally generate headings via Ollama (per paragraph)
+    headings: Optional[List[str]] = None
+    if ollama_model:
+        ensure_deps(require_ollama=True)
+        click.echo(f"🤖 Generating headings with Ollama model '{ollama_model}' (per paragraph)...")
+        headings = generate_headings_with_ollama_per_paragraph(
+            paragraphs=paragraphs,
+            model=ollama_model,
+            endpoint=ollama_endpoint,
+            timeout=ollama_timeout,
+        )
+
+    # Build LaTeX with (optional) headings
+    latex_doc = build_latex_document(title, paragraphs, headings=headings)
     with open(latex_path, "w", encoding="utf-8") as f:
         f.write(latex_doc)
 
-    print("✅ Done.")
-    print(f"Transcript (TXT): {transcript_path}")
-    print(f"LaTeX (TEX):      {latex_path}")
+    click.echo("✅ Done.")
+    click.echo(f"Transcript (TXT): {transcript_path}")
+    click.echo(f"LaTeX (TEX):      {latex_path}")
 
 
 if __name__ == "__main__":
-    main()
+    transcriptex()
