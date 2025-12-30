@@ -4,7 +4,7 @@
 Transcriptex (Click-based CLI)
 
 Features:
-- Resolve YouTube video ID & title with yt-dlp
+- Resolve YouTube video ID & title with yt-dlp (with external JS runtime support)
 - Fetch transcript via youtube-transcript-api (class methods)
 - Local Whisper transcription (default) using open-source `openai-whisper`
   * Optional API mode with OpenAI Speech-to-Text (off by default)
@@ -13,6 +13,7 @@ Features:
 - Write TXT + LaTeX outputs under BASE_DIR (default: ~/transcriptex)
 - Reuse existing downloaded audio in BASE_DIR/audio/<base_name>.<ext> when present
 - Logging via Python `logging` (use --log-level, --log-file)
+- yt-dlp JS runtime auto-detection (Deno/Node/Bun/QuickJS) or --js-runtime override
 
 Usage:
   transcriptex [OPTIONS] ID_OR_URL
@@ -23,7 +24,8 @@ import re
 import sys
 import json
 import logging
-from typing import List, Tuple, Optional
+import shutil
+from typing import List, Tuple, Optional, Dict
 
 import click
 
@@ -54,7 +56,7 @@ except ImportError:
 try:
     import requests
 except ImportError:
-    requests = None
+        requests = None
 
 # OpenAI API (optional; used only if whisper-mode=api)
 try:
@@ -192,10 +194,74 @@ def build_latex_document(title: str, paragraphs: List[str], headings: Optional[L
     return latex
 
 
+# ------------------------ yt-dlp JS runtime selection ------------------------
+
+def _parse_runtime_spec(spec: str) -> Dict[str, Dict[str, str]]:
+    """
+    Convert 'runtime' or 'runtime:/path/to/bin' to {'runtime': {'path': '/path/to/bin'}}.
+    If path not provided, try shutil.which(runtime); include empty dict if not found.
+    """
+    parts = spec.split(":", 1)
+    runtime = parts[0].strip().lower()
+    path = parts[1].strip() if len(parts) == 2 and parts[1].strip() else shutil.which(runtime)
+    return {runtime: ({'path': path} if path else {})}
+
+def build_js_runtimes_dict(override: Optional[str] = None) -> Optional[Dict[str, Dict[str, str]]]:
+    """
+    Build a dict suitable for yt-dlp's 'js_runtimes' Python API:
+      {'deno': {'path': '/usr/bin/deno'}} or {'node': {'path': '/usr/local/bin/node'}}.
+    Priority: override -> env(YTDLP_JS_RUNTIME) -> auto-detect [deno, node, bun, quickjs].
+    If no runtime is found, return None (yt-dlp may enable deno by default if available).
+    """
+    if override:
+        return _parse_runtime_spec(override)
+
+    env_val = os.environ.get("YTDLP_JS_RUNTIME")
+    if env_val:
+        return _parse_runtime_spec(env_val)
+
+    candidates = [
+        ("deno", shutil.which("deno")),
+        ("node", shutil.which("node")),
+        ("bun", shutil.which("bun")),
+        ("quickjs", shutil.which("qjs")),  # QuickJS commonly installed as 'qjs'
+    ]
+    for name, path in candidates:
+        if path:
+            return {name: {'path': path}}
+    return None
+
+def _log_js_runtime(js_rt_dict: Optional[Dict[str, Dict[str, str]]], context: str):
+    """
+    Log at INFO level which JS runtime is used (name + path), or that none was provided.
+    """
+    if js_rt_dict:
+        # Typically a single runtime entry, but iterate defensively
+        for name, cfg in js_rt_dict.items():
+            path = cfg.get('path') or 'PATH lookup / default'
+            logger.info("yt-dlp JS runtime (%s): %s (%s)", context, name, path)
+    else:
+        logger.info(
+            "yt-dlp JS runtime (%s): none provided. yt-dlp will use its defaults "
+            "(Deno enabled by default if available).", context
+        )
+
+
 # ------------------------ YouTube functions ------------------------
 
-def get_youtube_metadata(id_or_url: str) -> Tuple[str, str]:
-    opts = {"quiet": True, "skip_download": True}
+def get_youtube_metadata(id_or_url: str, js_runtime: Optional[str] = None) -> Tuple[str, str]:
+    js_rt_dict = build_js_runtimes_dict(override=js_runtime)
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "ignoreerrors": True,
+        "no_warnings": True,
+    }
+    if js_rt_dict:
+        opts["js_runtimes"] = js_rt_dict
+
+    _log_js_runtime(js_rt_dict, context="metadata")
+
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(id_or_url, download=False)
         video_id = info.get("id")
@@ -203,6 +269,9 @@ def get_youtube_metadata(id_or_url: str) -> Tuple[str, str]:
         if not video_id:
             raise RuntimeError("yt-dlp could not determine the video ID.")
         logger.info("Resolved YouTube metadata: id=%s title=%r", video_id, title)
+        logger.debug(
+            "Tip: External JS runtime improves format coverage; see yt-dlp EJS guide."
+        )
         return video_id, title
 
 
@@ -229,21 +298,35 @@ def get_youtube_transcript(video_id: str, languages: Optional[List[str]] = None)
 
 # ------------------------ Audio download (yt-dlp) ------------------------
 
-def download_audio_with_ytdlp(id_or_url: str, audio_dir: str, base_name: str) -> str:
+def download_audio_with_ytdlp(id_or_url: str, audio_dir: str, base_name: str,
+                              js_runtime: Optional[str] = None) -> str:
     """
     Download best available audio-only stream with yt-dlp without re-encoding.
     Returns the local path to the downloaded file (.webm, .m4a, etc).
     """
+    js_rt_dict = build_js_runtimes_dict(override=js_runtime)
     outtmpl = os.path.join(audio_dir, f"{base_name}.%(ext)s")
     opts = {
         "quiet": True,
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
+        "ignoreerrors": True,
+        "no_warnings": True,
     }
+    if js_rt_dict:
+        opts["js_runtimes"] = js_rt_dict
+
+    _log_js_runtime(js_rt_dict, context="download")
+
     logger.info("Downloading audio (bestaudio) to: %s", outtmpl)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(id_or_url, download=True)
+        # Contextual tip: SABR-only formats may be missing direct URLs; yt-dlp picks available ones.
+        logger.debug(
+            "If some web/web_safari formats are missing URLs, YouTube may be forcing SABR streaming; "
+            "yt-dlp will select available formats. See issue #12482."
+        )
         path = ydl.prepare_filename(info)  # actual path with chosen extension
         logger.info("Downloaded audio file: %s", path)
         return path
@@ -273,7 +356,8 @@ def _find_existing_audio(audio_dir: str, base_name: str) -> Optional[str]:
     return chosen
 
 
-def get_or_download_audio(id_or_url: str, audio_dir: str, base_name: str) -> Tuple[str, bool]:
+def get_or_download_audio(id_or_url: str, audio_dir: str, base_name: str,
+                          js_runtime: Optional[str] = None) -> Tuple[str, bool]:
     """
     Reuse existing audio file if present; otherwise download it.
     Returns (audio_path, downloaded_now_flag).
@@ -282,7 +366,7 @@ def get_or_download_audio(id_or_url: str, audio_dir: str, base_name: str) -> Tup
     if existing:
         logger.info("Reusing existing audio file: %s", existing)
         return existing, False
-    audio_path = download_audio_with_ytdlp(id_or_url, audio_dir, base_name)
+    audio_path = download_audio_with_ytdlp(id_or_url, audio_dir, base_name, js_runtime=js_runtime)
     return audio_path, True
 
 
@@ -490,6 +574,12 @@ def generate_headings_with_ollama_per_paragraph(
     help="Keep downloaded audio files (in BASE_DIR/audio).",
 )
 @click.option(
+    "--js-runtime",
+    default=None,
+    help=("External JS runtime for yt-dlp (e.g., 'deno', 'node:/usr/local/bin/node'). "
+          "If omitted, Transcriptex auto-detects or uses YTDLP_JS_RUNTIME env var."),
+)
+@click.option(
     "--log-level",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=True),
     default="INFO",
@@ -502,12 +592,13 @@ def generate_headings_with_ollama_per_paragraph(
     default=None,
     help="Optional path to write logs to a file instead of stderr.",
 )
-@click.version_option(version="0.4.0", prog_name="transcriptex")
+@click.version_option(version="0.4.2", prog_name="transcriptex")
 def transcriptex(id: str, service: str, transcriber: str, whisper_mode: str, whisper_model: Optional[str],
                  whisper_language: Optional[str], whisper_task: str,
                  paragraph_chars: int, force: bool,
                  ollama_model: Optional[str], ollama_endpoint: str, ollama_timeout: int,
                  base_dir: str, keep_audio: bool,
+                 js_runtime: Optional[str],
                  log_level: str, log_file: Optional[str]):
     """
     Download transcript and produce LaTeX + TXT under BASE_DIR (default: ~/transcriptex).
@@ -550,7 +641,7 @@ def transcriptex(id: str, service: str, transcriber: str, whisper_mode: str, whi
 
     # Resolve metadata (ID + title) using yt-dlp
     try:
-        video_id, title = get_youtube_metadata(id)
+        video_id, title = get_youtube_metadata(id, js_runtime=js_runtime)
     except Exception as e:
         logger.error("Error getting video metadata via yt-dlp: %s", e)
         sys.exit(2)
@@ -602,7 +693,7 @@ def transcriptex(id: str, service: str, transcriber: str, whisper_mode: str, whi
             logger.info("Transcript written (YouTube): %s", transcript_path)
         else:
             # Whisper transcription path (default behavior)
-            audio_file_path, downloaded_now = get_or_download_audio(id, audio_dir, base_name)
+            audio_file_path, downloaded_now = get_or_download_audio(id, audio_dir, base_name, js_runtime=js_runtime)
             file_size = os.path.getsize(audio_file_path)
             logger.info("Audio file size: %d bytes", file_size)
 
